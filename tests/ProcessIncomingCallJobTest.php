@@ -82,7 +82,7 @@ class ProcessIncomingCallJobTest extends TestCase
     }
 
     /** @test */
-    public function it_releases_operator_back_to_pool_on_race_condition(): void
+    public function it_only_assigns_one_operator_per_call(): void
     {
         $operator1 = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subHour()]);
         $operator2 = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subMinutes(30)]);
@@ -95,7 +95,7 @@ class ProcessIncomingCallJobTest extends TestCase
         $this->assertEquals($operator1->id, $call->operator_id);
         $this->assertEquals('assigned', $call->status);
 
-        // Второй оператор должен остаться свободным
+        // Второй оператор не должен был быть затронут
         $operator2->refresh();
         $this->assertTrue($operator2->available);
     }
