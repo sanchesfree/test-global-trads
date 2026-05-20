@@ -1,22 +1,18 @@
 <?php
 
 /**
- * Альтернативная реализация захвата оператора через Redis+Lua.
+ * Захват оператора через Redis sorted set.
  *
  * Используется при высокой нагрузке (десятки/сотни RPS), когда
- * SELECT-FOR-UPDATE на operators становится bottleneck.
+ * блокировки в БД на operators становятся bottleneck.
  *
  * Логика:
  *  1. Операторы при логине добавляются в sorted set 'operators:available'
  *     с score = last_call_at (или timestamp).
- *  2. Lua-скрипт атомарно извлекает оператора с наименьшим score
- *     и удаляет его из sorted set.
+ *  2. ZPOPMIN атомарно извлекает оператора с наименьшим score.
  *  3. При завершении звонка оператор возвращается в sorted set.
  *
- * Преимущества:
- *  - Нет блокировок в БД.
- *  - O(log N) операций.
- *  - Полная атомарность через Lua.
+ * ZPOPMIN — одна Redis-команда, уже атомарная. Lua не нужен.
  *
  * Риски:
  *  - Требует синхронизации Redis ↔ БД (crash recovery).
@@ -32,19 +28,6 @@ class OperatorPool
     private const AVAILABLE_SET = 'operators:available';
 
     /**
-     * Lua-скрипт: атомарно извлечь оператора с минимальным last_call_at.
-     *
-     * Возвращает operator_id или nil если нет свободных.
-     */
-    private const ACQUIRE_LUA = <<<'LUA'
-        local result = redis.call('ZPOPMIN', KEYS[1])
-        if #result == 0 then
-            return false
-        end
-        return result[1]
-    LUA;
-
-    /**
      * Зарегистрировать оператора как доступного.
      */
     public function makeAvailable(int $operatorId, ?int $lastCallAt = null): void
@@ -54,14 +37,27 @@ class OperatorPool
     }
 
     /**
-     * Атомарно захватить свободного оператора.
+     * Захватить свободного оператора с наименьшим last_call_at.
      *
-     * @return int|null ID оператора или null
+     * ZPOPMIN — атомарная команда: извлекает и удаляет элемент
+     * с минимальным score из sorted set. Два параллельных клиента
+     * не получат одного и того же оператора.
+     *
+     * @return int|null ID оператора или null если свободных нет
      */
     public function acquire(): ?int
     {
-        $result = Redis::eval(self::ACQUIRE_LUA, 1, self::AVAILABLE_SET);
-        return $result !== null ? (int) $result : null;
+        $result = Redis::zpopmin(self::AVAILABLE_SET);
+
+        if ($result === null || $result === false) {
+            return null;
+        }
+
+        // phpredis возвращает ['id' => score] или [id => score]
+        // Нам нужен только ID (ключ)
+        $result = is_array($result) ? array_key_first($result) : $result;
+
+        return (int) $result;
     }
 
     /**
