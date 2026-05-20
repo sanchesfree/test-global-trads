@@ -42,9 +42,7 @@ class ProcessIncomingCallJobTest extends TestCase
         $call1 = Call::factory()->create(['status' => 'new', 'phone' => '+79000000001']);
         $call2 = Call::factory()->create(['status' => 'new', 'phone' => '+79000000002']);
 
-        // Имитируем параллельную обработку: оба Job-а стартуют «одновременно»
-        // в рамках одной транзакции с SELECT FOR UPDATE второй должен увидеть,
-        // что оператор уже занят.
+        // Два звонка, один оператор — второй не должен получить того же оператора
 
         // Обрабатываем первый звонок
         (new ProcessIncomingCallJob($call1->id))->handle();
@@ -56,7 +54,7 @@ class ProcessIncomingCallJobTest extends TestCase
         $call2->refresh();
 
         $this->assertEquals('assigned', $call1->status);
-        $this->assertEquals('new', $call2->status);  // остался new, т.к. release() не меняет статус
+        $this->assertEquals('new', $call2->status);  // оператор уже занят — звонок не назначен
         $this->assertEquals($operator->id, $call1->operator_id);
         $this->assertNull($call2->operator_id);
     }
@@ -76,7 +74,7 @@ class ProcessIncomingCallJobTest extends TestCase
 
         (new ProcessIncomingCallJob($call->id))->handle();
 
-        // Статус не изменился, оператор не перевыбран
+        // Если Job повторился — ничего не должно произойти
         $call->refresh();
         $this->assertEquals('assigned', $call->status);
     }
@@ -89,7 +87,7 @@ class ProcessIncomingCallJobTest extends TestCase
 
         $call = Call::factory()->create(['status' => 'new', 'phone' => '+79000000001']);
 
-        // Обрабатываем первый раз — должен получить operator с минимальным last_call_at
+        // Оператор с самым старым last_call_at должен быть назначен первым
         (new ProcessIncomingCallJob($call->id))->handle();
 
         $call->refresh();
@@ -106,21 +104,14 @@ class ProcessIncomingCallJobTest extends TestCase
         $call = Call::factory()->create(['status' => 'new', 'phone' => '+79000000001']);
 
         $job = new ProcessIncomingCallJob($call->id);
-        // Привязываем Job к фейковой очереди для проверки release()
         Queue::fake();
-
-        // Вручную вызовем handle, потому что нам нужно проверить статус в БД
-        // Но release() через Queue::fake не сработает — проверяем через логику
-        // Вместо этого тестируем, что исключение НЕ бросается
 
         $telephony = $this->mock(TelephonyClient::class);
         $this->app->instance(TelephonyClient::class, $telephony);
 
-        // В альтернативной реализации без Exception:
-        // (new ProcessIncomingCallJob($call->id))->handle();
-        // $call->refresh();
-        // $this->assertEquals('pending_operator', $call->status);
-        $this->assertTrue(true); // Placeholder — зависит от реализации release
+        // В оригинальном коде здесь бросался Exception('No available operators').
+        // В исправленном — Job тихо просит retry через release().
+        $this->assertTrue(true); // TODO: интеграционный тест для release()
     }
 
     /** @test */
@@ -184,7 +175,7 @@ class ProcessIncomingCallJobTest extends TestCase
 
         (new ProcessIncomingCallJob(999999))->handle();
 
-        // Не бросает исключение
+        // Тихий выход — без исключений
         $this->assertTrue(true);
     }
 
