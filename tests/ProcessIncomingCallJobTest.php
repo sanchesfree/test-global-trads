@@ -16,9 +16,7 @@ use App\Models\Call;
 use App\Models\Client;
 use App\Models\Operator;
 use App\Services\TelephonyClient;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Queue;
 use Mockery;
 use Tests\TestCase;
 
@@ -63,6 +61,9 @@ class ProcessIncomingCallJobTest extends TestCase
     public function it_is_idempotent_when_call_already_assigned(): void
     {
         $operator = Operator::factory()->create(['available' => false]);
+        // Свободные операторы есть — но Job не должен переназначать
+        Operator::factory()->count(3)->create(['available' => true, 'last_call_at' => now()->subHour()]);
+
         $call = Call::factory()->create([
             'status'      => 'assigned',
             'operator_id' => $operator->id,
@@ -74,24 +75,29 @@ class ProcessIncomingCallJobTest extends TestCase
 
         (new ProcessIncomingCallJob($call->id))->handle();
 
-        // Если Job повторился — ничего не должно произойти
+        // Если Job повторился — оператор не должен измениться
         $call->refresh();
         $this->assertEquals('assigned', $call->status);
+        $this->assertEquals($operator->id, $call->operator_id);
     }
 
     /** @test */
-    public function it_does_not_override_operator_if_concurrent_worker_changed_status(): void
+    public function it_releases_operator_back_to_pool_on_race_condition(): void
     {
         $operator1 = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subHour()]);
         $operator2 = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subMinutes(30)]);
 
         $call = Call::factory()->create(['status' => 'new', 'phone' => '+79000000001']);
 
-        // Оператор с самым старым last_call_at должен быть назначен первым
         (new ProcessIncomingCallJob($call->id))->handle();
 
         $call->refresh();
         $this->assertEquals($operator1->id, $call->operator_id);
+        $this->assertEquals('assigned', $call->status);
+
+        // Второй оператор должен остаться свободным
+        $operator2->refresh();
+        $this->assertTrue($operator2->available);
     }
 
     // =====================================================================
@@ -99,19 +105,22 @@ class ProcessIncomingCallJobTest extends TestCase
     // =====================================================================
 
     /** @test */
-    public function it_marks_call_as_pending_operator_when_no_operators_available(): void
+    public function it_does_not_throw_when_no_operators_available(): void
     {
         $call = Call::factory()->create(['status' => 'new', 'phone' => '+79000000001']);
 
-        $job = new ProcessIncomingCallJob($call->id);
-        Queue::fake();
-
         $telephony = $this->mock(TelephonyClient::class);
+        $telephony->shouldNotReceive('sendCallAssigned');
         $this->app->instance(TelephonyClient::class, $telephony);
 
         // В оригинальном коде здесь бросался Exception('No available operators').
         // В исправленном — Job тихо просит retry через release().
-        $this->assertTrue(true); // TODO: интеграционный тест для release()
+        (new ProcessIncomingCallJob($call->id))->handle();
+
+        // Звонок не должен быть назначен, но и не упал
+        $call->refresh();
+        $this->assertEquals('new', $call->status);
+        $this->assertNull($call->operator_id);
     }
 
     /** @test */
@@ -130,6 +139,7 @@ class ProcessIncomingCallJobTest extends TestCase
 
         $call->refresh();
         $this->assertEquals($client->id, $call->client_id);
+        $this->assertEquals('assigned', $call->status);
     }
 
     /** @test */
@@ -164,6 +174,10 @@ class ProcessIncomingCallJobTest extends TestCase
 
         $this->expectException(\RuntimeException::class);
         (new ProcessIncomingCallJob($call->id))->handle();
+
+        // Оператор уже назначен в БД — при retry Job увидит 'assigned' и не переназначит
+        $call->refresh();
+        $this->assertEquals('assigned', $call->status);
     }
 
     /** @test */
@@ -174,9 +188,6 @@ class ProcessIncomingCallJobTest extends TestCase
         $this->app->instance(TelephonyClient::class, $telephony);
 
         (new ProcessIncomingCallJob(999999))->handle();
-
-        // Тихий выход — без исключений
-        $this->assertTrue(true);
     }
 
     // =====================================================================
@@ -186,6 +197,9 @@ class ProcessIncomingCallJobTest extends TestCase
     /** @test */
     public function it_logs_structured_info_on_successful_assignment(): void
     {
+        // Override setUp's Log::spy() — this test needs to assert specific log calls
+        Log::restore();
+
         $operator = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subHour()]);
         $call = Call::factory()->create(['status' => 'new', 'phone' => '+79000000001']);
 
