@@ -32,7 +32,12 @@ class ProcessIncomingCallJobTest extends TestCase
     // КРИТИЧЕСКИЕ — Race Conditions & Idempotency
     // =====================================================================
 
-    /** @test */
+    /**
+     * @test
+     * Главный баг оригинального кода: два параллельных Job-а могут захватить
+     * одного оператора. Проверяем что после назначения оператор занят,
+     * и второй звонок остаётся без оператора.
+     */
     public function it_does_not_assign_same_operator_to_two_calls(): void
     {
         $operator = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subHour()]);
@@ -57,7 +62,12 @@ class ProcessIncomingCallJobTest extends TestCase
         $this->assertNull($call2->operator_id);
     }
 
-    /** @test */
+    /**
+     * @test
+     * Если worker упал после назначения, Redis отдаст Job повторно.
+     * Проверяем что повторный вызов не переназначит оператора,
+     * даже если есть свободные.
+     */
     public function it_is_idempotent_when_call_already_assigned(): void
     {
         $operator = Operator::factory()->create(['available' => false]);
@@ -81,7 +91,11 @@ class ProcessIncomingCallJobTest extends TestCase
         $this->assertEquals($operator->id, $call->operator_id);
     }
 
-    /** @test */
+    /**
+     * @test
+     * Один звонок должен захватить ровно одного оператора.
+     * Остальные операторы остаются свободными.
+     */
     public function it_only_assigns_one_operator_per_call(): void
     {
         $operator1 = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subHour()]);
@@ -104,7 +118,12 @@ class ProcessIncomingCallJobTest extends TestCase
     // ВАЖНЫЕ — Retry, Error Handling, Business Logic
     // =====================================================================
 
-    /** @test */
+    /**
+     * @test
+     * В оригинале бросался Exception — это засоряло мониторинг.
+     * Теперь Job тихо просит retry через release(),
+     * звонок остаётся в статусе 'new'.
+     */
     public function it_does_not_throw_when_no_operators_available(): void
     {
         $call = Call::factory()->create(['status' => 'new', 'phone' => '+79000000001']);
@@ -123,7 +142,11 @@ class ProcessIncomingCallJobTest extends TestCase
         $this->assertNull($call->operator_id);
     }
 
-    /** @test */
+    /**
+     * @test
+     * Если в БД есть клиент с таким же номером телефона —
+     * привязать его к звонку.
+     */
     public function it_links_client_by_phone(): void
     {
         $client = Client::factory()->create(['phone' => '+79000000001']);
@@ -142,7 +165,11 @@ class ProcessIncomingCallJobTest extends TestCase
         $this->assertEquals('assigned', $call->status);
     }
 
-    /** @test */
+    /**
+     * @test
+     * Если клиента с таким номером нет в БД —
+     * звонок всё равно назначается, client_id остаётся null.
+     */
     public function it_handles_call_without_existing_client(): void
     {
         $operator = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subHour()]);
@@ -160,7 +187,12 @@ class ProcessIncomingCallJobTest extends TestCase
         $this->assertEquals('assigned', $call->status);
     }
 
-    /** @test */
+    /**
+     * @test
+     * Если HTTP-запрос в телефонию упал — Job должен бросить исключение
+     * (чтобы очередь сделала retry), но оператор уже назначен в БД.
+     * При повторе Job увидит 'assigned' и не переназначит.
+     */
     public function it_retries_on_telephony_failure(): void
     {
         $operator = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subHour()]);
@@ -180,7 +212,10 @@ class ProcessIncomingCallJobTest extends TestCase
         $this->assertEquals('assigned', $call->status);
     }
 
-    /** @test */
+    /**
+     * @test
+     * Если звонок удалён из БД до обработки — Job не должен упасть.
+     */
     public function it_silently_returns_when_call_not_found(): void
     {
         $telephony = $this->mock(TelephonyClient::class);
@@ -194,7 +229,11 @@ class ProcessIncomingCallJobTest extends TestCase
     // NICE TO HAVE — Логирование, метрики
     // =====================================================================
 
-    /** @test */
+    /**
+     * @test
+     * При успешном назначении логируется 'Call assigned'
+     * с call_id, operator_id и client_id.
+     */
     public function it_logs_structured_info_on_successful_assignment(): void
     {
         // Override setUp's Log::spy() — this test needs to assert specific log calls
@@ -217,7 +256,11 @@ class ProcessIncomingCallJobTest extends TestCase
         (new ProcessIncomingCallJob($call->id))->handle();
     }
 
-    /** @test */
+    /**
+     * @test
+     * Операторы распределяются по принципу «кто дольше не работал — тот следующий».
+     * Проверяем что выбран оператор с самым старым last_call_at.
+     */
     public function it_selects_operator_with_oldest_last_call_at(): void
     {
         $oldest = Operator::factory()->create(['available' => true, 'last_call_at' => now()->subDays(3)]);
